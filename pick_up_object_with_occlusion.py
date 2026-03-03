@@ -9,43 +9,41 @@ import numpy as np
 # robot.move_base(vx, steps)
 
 def ensure_reachability(target_object_name: str, robot, max_attempts: int = 3, move_distance: float = 0.7, move_steps: int = 40) -> bool:
-    \"\"\"
+    """
     Checks if the target object is reachable and moves the robot base if not.
     Returns True if reachable (or made reachable), False otherwise.
-    \"\"\"
+    """
     for attempt in range(max_attempts):
-        print(f"Attempt {attempt + 1} to ensure reachability for {target_object_name}...")
+        print(f"[Reachability] Attempt {attempt + 1}/{max_attempts} to ensure reachability for {target_object_name}...")
         target_result = robot.get_object_position_from_mask(target_object_name)
         if target_result is not None:
-            # In a real scenario, we'd have a more sophisticated reachability check.
-            # For now, we assume if we found it, it's potentially reachable after base movement.
-            print(f"Found {target_object_name} at {target_result['3d_position']}")
+            print(f"[Reachability] Found {target_object_name} at {target_result['3d_position']}. Assuming reachable.")
             return True
         else:
-            print(f"Could not locate {target_object_name}. Moving robot base to improve reachability.")
+            print(f"[Reachability] Could not locate {target_object_name}. Moving robot base to improve reachability (vx={move_distance}, steps={move_steps}).")
             robot.move_base(vx=move_distance, steps=move_steps)
 
-    print(f"Failed to ensure reachability for {target_object_name} after {max_attempts} attempts.")
+    print(f"[Reachability] Failed to ensure reachability for {target_object_name} after {max_attempts} attempts. Aborting.")
     return False
 
 def remove_occluding_object(occluding_object_name: str, target_object_pos: np.ndarray, robot) -> bool:
-    \"\"\"
+    """
     Removes an occluding object from on top of the target object.
     Returns True if successful or no occluding object was found, False otherwise.
-    \"\"\"
+    """
     if not occluding_object_name: # Handle cases where there is no occluding object
-        print("No occluding object specified. Skipping removal.")
+        print("[Occlusion] No occluding object specified. Skipping removal.")
         return True
 
-    print(f"Attempting to remove occluding object: {occluding_object_name}")
+    print(f"[Occlusion] Attempting to remove occluding object: {occluding_object_name}")
     occluder_result = robot.get_object_position_from_mask(occluding_object_name)
 
     if occluder_result is None:
-        print(f"No {occluding_object_name} found to remove. Assuming it's already clear or not present.")
+        print(f"[Occlusion] No {occluding_object_name} found to remove. Assuming it's already clear or not present.")
         return True # Nothing to remove, so consider it successful
 
     occluder_pos = np.array(occluder_result['3d_position'])
-    print(f"Found {occluding_object_name} at {occluder_pos}")
+    print(f"[Occlusion] Found {occluding_object_name} at {occluder_pos}")
 
     # Define pre-grasp and grasp positions for the occluder.
     pre_grasp_occluder = occluder_pos + [0, 0, 0.15] # 15 cm above
@@ -61,26 +59,27 @@ def remove_occluding_object(occluding_object_name: str, target_object_pos: np.nd
     # Define a placement location for the occluder (e.g., to the side of original target).
     # This assumes a flat surface for placement, adjusting z to a safe counter height.
     place_pos_occluder = target_object_pos + [0.20, 0, 0] # Move 20cm to the side
-    place_pos_occluder[2] = max(0.8, target_object_pos[2] + 0.1) # Ensure it's placed above the target and on a surface
+    # Ensure placement height is reasonable, e.g., on a counter surface or slightly above the target.
+    place_pos_occluder[2] = max(0.8, target_object_pos[2] + 0.1) # Minimum 0.8m or 10cm above target
     robot.move_right_arm_to(place_pos_occluder.tolist(), grasp_ori)
     robot.open_right_gripper()
-    print(f"Successfully removed {occluding_object_name}.")
+    print(f"[Occlusion] Successfully removed {occluding_object_name} and placed it at {place_pos_occluder}.")
     return True
 
 def pick_up_object(object_name: str, robot) -> bool:
-    \"\"\"\
+    """
     Picks up the specified object.
     Returns True if successful, False otherwise.
-    \"\"\"
-    print(f"Attempting to pick up: {object_name}")
+    """
+    print(f"[Pickup] Attempting to pick up: {object_name}")
     object_result = robot.get_object_position_from_mask(object_name)
 
     if object_result is None:
-        print(f"Error: Could not locate {object_name} to pick up.")
+        print(f"[Pickup] Error: Could not locate {object_name} to pick up.")
         return False
 
     obj_pos = np.array(object_result['3d_position'])
-    print(f"Found {object_name} at {obj_pos}")
+    print(f"[Pickup] Found {object_name} at {obj_pos}")
 
     # Define pre-grasp and grasp positions.
     pre_grasp_obj = obj_pos + [0, 0, 0.15] # 15 cm above
@@ -94,62 +93,46 @@ def pick_up_object(object_name: str, robot) -> bool:
 
     lift_pos = obj_pos + [0, 0, 0.2] # Lift 20 cm above original position
     robot.move_right_arm_to(lift_pos.tolist(), grasp_ori)
-    print(f"Successfully picked up {object_name}.")
+    print(f"[Pickup] Successfully picked up {object_name}.")
     return True
 
 def execute_pick_up_with_occlusion_handling(robot, target_object_name: str, occluding_object_name: str = None) -> bool:
-    \"\"\"\
+    """
     Executes the task of picking up a target object,
     optionally handling an occluding object.
     The robot base will attempt to move closer if the target is not initially reachable.
     Returns True if the task is completed successfully, False otherwise.
-    \"\"\"
-    print(f"Starting task: Pick up {target_object_name} (Occluding object: {occluding_object_name or 'None'})")
+    """
+    print(f"[Main Task] Starting task: Pick up {target_object_name} (Occluding object: {occluding_object_name or 'None'})")
 
     # Step 1: Ensure robot can reach the target area
     if not ensure_reachability(target_object_name, robot):
-        print(f"Failed to ensure reachability for {target_object_name}. Aborting.")
+        print(f"[Main Task] Failed to ensure reachability for {target_object_name}. Aborting.")
         return False
 
     # Get initial position of the target object (after potential base movement)
     target_result = robot.get_object_position_from_mask(target_object_name)
     if target_result is None:
-        print(f"Error: {target_object_name} not found even after reachability check. Aborting.")
+        print(f"[Main Task] Error: {target_object_name} not found even after reachability check. Aborting.")
         return False
     initial_target_pos = np.array(target_result['3d_position'])
 
     # Step 2: Remove occluding object if present and specified
     if occluding_object_name:
         if not remove_occluding_object(occluding_object_name, initial_target_pos, robot):
-            print(f"Failed to remove occluding object: {occluding_object_name}. Aborting.")
+            print(f"[Main Task] Failed to remove occluding object: {occluding_object_name}. Aborting.")
             return False
 
     # Step 3: Pick up the target object
     # Re-check reachability and object position in case of significant scene changes
     # after occluder removal, or if the robot moved.
     if not ensure_reachability(target_object_name, robot):
-        print(f"Failed to re-ensure reachability for {target_object_name} after occlusion handling. Aborting.")
+        print(f"[Main Task] Failed to re-ensure reachability for {target_object_name} after occlusion handling. Aborting.")
         return False
 
     if not pick_up_object(target_object_name, robot):
-        print(f"Failed to pick up {target_object_name}. Aborting.")
+        print(f"[Main Task] Failed to pick up {target_object_name}. Aborting.")
         return False
 
-    print(f"Task completed: Picked up {target_object_name} with occlusion handling.")
+    print(f"[Main Task] Task completed: Picked up {target_object_name} with occlusion handling.")
     return True
-
-# This script is designed to be called by an external executor that provides the 'robot' object.
-# Example usage (conceptual, as 'robot' is external):
-# from your_robot_api import Robot
-# robot_instance = Robot()
-# success = execute_pick_up_with_occlusion_handling(robot_instance, "apple", "book")
-# if success:
-#    print("Apple picked up!")
-# else:
-#    print("Task failed.")
-
-# success_no_occlusion = execute_pick_up_with_occlusion_handling(robot_instance, "banana")
-# if success_no_occlusion:
-#    print("Banana picked up without occlusion!")
-# else:
-#    print("Banana pick up failed.")
