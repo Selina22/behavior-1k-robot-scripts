@@ -6,7 +6,7 @@ import numpy as np
 # robot.open_right_gripper()
 # robot.close_right_gripper()
 # robot.move_right_arm_to(position, orientation, steps=20)
-# robot.move_base(vx, steps)
+# robot.move_base(vx, vy, vyaw, steps)
 
 def ensure_reachability(target_object_name: str, robot, max_attempts: int = 3, move_distance: float = 0.7, move_steps: int = 40) -> bool:
     """
@@ -20,8 +20,9 @@ def ensure_reachability(target_object_name: str, robot, max_attempts: int = 3, m
             print(f"[Reachability] Found {target_object_name} at {target_result['3d_position']}. Assuming reachable.")
             return True
         else:
-            print(f"[Reachability] Could not locate {target_object_name}. Moving robot base to improve reachability (vx={move_distance}, steps={move_steps}).")
-            robot.move_base(vx=move_distance, steps=move_steps)
+            print(f"[Reachability] Could not locate {target_object_name}. Moving robot base to improve reachability (vx={move_distance}, vy=0.0, vyaw=0.0, steps={move_steps}).")
+            # Ensure vy and vyaw are always passed, defaulting to 0.0 for simple forward movement
+            robot.move_base(vx=move_distance, vy=0.0, vyaw=0.0, steps=move_steps)
 
     print(f"[Reachability] Failed to ensure reachability for {target_object_name} after {max_attempts} attempts. Aborting.")
     return False
