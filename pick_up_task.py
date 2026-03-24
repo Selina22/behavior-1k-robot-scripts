@@ -16,6 +16,13 @@ Experiment 2 (2026-03-23_17-46-38): Pick up green cup with yellow block obstacle
 - get_grasp_pose + plan_grasp succeeded for cup handle grasp as fallback
 - Lesson: use naive_pointing fallback in locate_object; for cups/mugs, try
   get_grasp_pose as a fallback strategy when top-down fails with 'dt' errors
+
+Experiment 3 (2026-03-23_18-38-26): Pick up green mug on the shelf
+- Top-down grasp impossible due to shelf above; side grasp mandatory
+- get_grasp_pose('the green mug', 'grasp from the side') + plan_grasp worked first try
+- After grasping inside shelf: MUST retreat horizontally (x -= 0.15) BEFORE lifting
+  vertically to avoid collision with shelf above
+- Lesson: detect if object is in an enclosed space; use side grasp + horizontal retreat
 """
 
 import numpy as np
@@ -108,10 +115,16 @@ def top_down_grasp(robot, target_pos, z_offset=0.0):
     return check_grasp_success(robot)
 
 
-def grasp_via_plan(robot, label, description="grasp the object", hint_pos=None):
+def grasp_via_plan(robot, label, description="grasp the object", hint_pos=None,
+                   retreat_before_lift=False):
     """
-    Use get_grasp_pose + plan_grasp for more complex grasps (e.g., handles).
-    Learned from Exp 2: this works well for cup handles when top-down fails.
+    Use get_grasp_pose + plan_grasp for more complex grasps (e.g., handles, shelf objects).
+    Learned from Exp 2: works for cup handles when top-down fails.
+    Learned from Exp 3: for shelf objects, retreat horizontally before lifting.
+
+    Args:
+        retreat_before_lift: If True, move backward (x -= 0.15) before lifting.
+            Use this for objects inside enclosed spaces like shelves.
 
     Returns True if gripper indicates successful grasp.
     """
@@ -130,11 +143,21 @@ def grasp_via_plan(robot, label, description="grasp the object", hint_pos=None):
     robot.plan_grasp(grasp_candidates)
 
     if check_grasp_success(robot):
-        # Lift after successful grasp
         state = robot.get_state()['robot_state']
-        lift_pos = np.array(state['position'])
+        current_pos = np.array(state['position'])
+        current_ori = state['orientation']
+
+        if retreat_before_lift:
+            # Retreat horizontally first (learned from Exp 3: shelf objects)
+            retreat_pos = current_pos.copy()
+            retreat_pos[0] -= 0.15  # Pull back toward robot
+            robot.move_gripper_to(retreat_pos.tolist(), current_ori)
+            current_pos = retreat_pos
+
+        # Lift after grasp
+        lift_pos = current_pos.copy()
         lift_pos[2] += LIFT_HEIGHT
-        robot.move_gripper_to(lift_pos.tolist(), state['orientation'])
+        robot.move_gripper_to(lift_pos.tolist(), current_ori)
         return True
 
     return False
@@ -217,21 +240,23 @@ def place_obstacle(robot, target_pos):
     print("Obstacle placed to the side.")
 
 
-def pick_up(robot, target_label, obstacle_label=None):
+def pick_up(robot, target_label, obstacle_label=None, enclosed=False):
     """
     Main pick-up routine. Optionally removes an obstacle first, then
     locates and picks up the target object.
 
     Strategy (learned from experiments):
-    1. If obstacle exists, remove it first
-    2. Locate target and attempt top-down grasp
-    3. On failure: retry with recovery (neutral pose + re-perceive)
-    4. Final fallback: try get_grasp_pose + plan_grasp (works for handles)
+    - If obstacle exists, remove it first
+    - For enclosed objects (e.g., on a shelf): use side grasp directly
+    - For open objects (e.g., on a table): try top-down, then planned grasp
+    - Always re-perceive after failures
 
     Args:
         robot: The robot interface object
         target_label: String label for the object to pick up
         obstacle_label: Optional label for an obstacle to remove first
+        enclosed: If True, object is in an enclosed space (shelf, cabinet).
+            Uses side grasp + horizontal retreat instead of top-down.
 
     Returns:
         True if object was successfully picked up, False otherwise
@@ -239,6 +264,8 @@ def pick_up(robot, target_label, obstacle_label=None):
     print(f"=== Pick Up Task: '{target_label}' ===")
     if obstacle_label:
         print(f"    Obstacle to remove: '{obstacle_label}'")
+    if enclosed:
+        print(f"    Object is in enclosed space - using side grasp strategy")
 
     # Step 0: Remove obstacle if specified
     if obstacle_label:
@@ -259,7 +286,31 @@ def pick_up(robot, target_label, obstacle_label=None):
         print("FAILED: Could not locate target object.")
         return False
 
-    # Step 2: Attempt top-down grasp
+    # For enclosed objects: go directly to planned side grasp (Exp 3)
+    if enclosed:
+        if grasp_via_plan(robot, target_label,
+                          f"grasp the {target_label} from the side",
+                          hint_pos=target_pos,
+                          retreat_before_lift=True):
+            print(f"SUCCESS: Picked up '{target_label}' from enclosed space")
+            return True
+
+        # Retry once after returning to neutral
+        print("Side grasp failed, retrying...")
+        move_to_neutral(robot)
+        target_pos = locate_object(robot, target_label)
+        if target_pos is not None:
+            if grasp_via_plan(robot, target_label,
+                              f"grasp the {target_label} from the side",
+                              hint_pos=target_pos,
+                              retreat_before_lift=True):
+                print(f"SUCCESS: Picked up '{target_label}' on retry")
+                return True
+
+        print(f"FAILED: Could not pick up '{target_label}' from enclosed space.")
+        return False
+
+    # Step 2: Attempt top-down grasp (for open/table objects)
     if top_down_grasp(robot, target_pos):
         print(f"SUCCESS: Picked up '{target_label}'")
         return True
@@ -298,4 +349,5 @@ if __name__ == "__main__":
     # Example usage:
     # pick_up(robot, "green cup", obstacle_label="yellow block")
     # pick_up(robot, "green mug")
+    # pick_up(robot, "green mug", enclosed=True)  # Object on a shelf
     pass
