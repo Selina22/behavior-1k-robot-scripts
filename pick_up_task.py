@@ -41,9 +41,22 @@ Experiment 5 (2026-03-23_16-59-15): Pick up green cup with yellow block obstacle
 - Lesson: robot.reset() is a last-resort recovery for stuck states. Adding z_offset=+0.04
   to low-z objects is a proven fix. The approach height itself should ensure we don't
   go below the safe z threshold.
+
+
+Usage:
+    python pick_up_task.py -i "green mug"
+    python pick_up_task.py -i "green cup" --obstacle "yellow block"
+    python pick_up_task.py -i "green mug" --enclosed
 """
 
+import sys
+sys.path.append('/home/franka/vlmanipulation/droid')
+
+import argparse
 import numpy as np
+
+from droid.robot_env import RobotEnv
+from droid.vlm.api_current_w_pi_GR_15 import RealFrankaRobotApi, ImageEditApi
 
 
 # ============================================================
@@ -397,11 +410,94 @@ def pick_up(robot, target_label, obstacle_label=None, enclosed=False):
 
 
 # ============================================================
+# Robot Initialization
+# ============================================================
+
+def initialize_robot(instruction, use_motionplanner=True):
+    """
+    Initialize the Franka robot environment and API objects.
+
+    Args:
+        instruction: Task instruction string (e.g., "pick up the green mug")
+        use_motionplanner: Whether to use the motion planner (default True)
+
+    Returns:
+        (robot, image_editor) tuple of initialized API objects
+    """
+    print("Initializing RobotEnv...")
+    env = RobotEnv()
+    env.reset()
+
+    # Initialize Pi0.5 controller (optional, for learned policy integration)
+    pi05_controller = None
+    resource_manager = None
+    try:
+        from droid.vlm.resource_manager import RobotResourceManager
+        resource_manager = RobotResourceManager(env)
+    except Exception:
+        pass
+
+    try:
+        sys.path.insert(0, '/home/franka/vlmanipulation')
+        from droid.vlm.pi05_master_embed import Pi05Controller
+        try:
+            env.camera_reader.disable_cameras()
+        except Exception:
+            pass
+        pi05_controller = Pi05Controller()
+        pi05_controller.initialize()
+        print("Pi0.5 daemon initialized.")
+        if resource_manager:
+            resource_manager.set_pi05_controller(pi05_controller)
+    except Exception as e:
+        print(f"Pi0.5 not available: {e}. Continuing without it.")
+
+    robot = RealFrankaRobotApi(env, instruction, use_motionplanner,
+                               pi05_controller, resource_manager)
+
+    # Ensure main pipeline has camera access after Pi0.5 init
+    try:
+        if resource_manager:
+            resource_manager.ensure_main_cameras()
+    except Exception:
+        pass
+
+    if pi05_controller:
+        robot.set_pi05_controller(pi05_controller)
+
+    image_editor = robot.image_editor
+
+    return robot, image_editor
+
+
+# ============================================================
 # Entry Point
 # ============================================================
 if __name__ == "__main__":
-    # Example usage:
-    # pick_up(robot, "green cup", obstacle_label="yellow block")
-    # pick_up(robot, "green mug")
-    # pick_up(robot, "green mug", enclosed=True)  # Object on a shelf
-    pass
+    parser = argparse.ArgumentParser(description="Pick up task for Franka manipulator")
+    parser.add_argument("-i", "--instruction", type=str, required=True,
+                        help="Target object label (e.g., 'green mug', 'blue cube')")
+    parser.add_argument("--obstacle", type=str, default=None,
+                        help="Obstacle object label to remove first (e.g., 'yellow block')")
+    parser.add_argument("--enclosed", action="store_true",
+                        help="Object is in an enclosed space (shelf/cabinet)")
+    parser.add_argument("--no-motionplanner", action="store_true",
+                        help="Disable motion planner")
+    args = parser.parse_args()
+
+    robot, image_editor = initialize_robot(
+        instruction=f"pick up the {args.instruction}",
+        use_motionplanner=not args.no_motionplanner,
+    )
+
+    success = pick_up(
+        robot,
+        target_label=args.instruction,
+        obstacle_label=args.obstacle,
+        enclosed=args.enclosed,
+    )
+
+    if success:
+        print("\n=== TASK COMPLETED SUCCESSFULLY ===")
+    else:
+        print("\n=== TASK FAILED ===")
