@@ -4,22 +4,18 @@ Pick Up Task - Robust Zero-Shot Script for Franka Manipulator
 Learns from VLM code-writing agent experiments to create a reliable
 pick-up policy that handles various objects and scenarios.
 
-Experiment 1 Analysis: Pick up the green mug (2026-03-20)
----------------------------------------------------------
-Key findings:
-- get_position_from_labels works for locating objects but may fail for
-  fine-grained parts (e.g., "handle of the green mug" had invalid depth)
-- get_grasp_pose + plan_grasp attempted first but resulted in gripper closing
-  on nothing (gripper_fraction_closed=0.99 = miss)
-- Recovery: manual top-down grasp succeeded on retry
-  - Moved to neutral [0.5, 0.0, 0.4] first
-  - Re-located mug via get_position_from_labels
-  - Used waypoint sequence: pre_grasp (+0.15z), approach (+0.05z), grasp (+0.02z)
-  - Gripper closed at 0.96 = successful grasp, then lifted +0.20z
-- Lesson: top-down manual grasp with proper waypoints is MORE reliable than
-  get_grasp_pose for simple objects on tables. Always re-perceive after failure.
+Experiment 1 (2026-03-20): Pick up the green mug
+- Top-down manual grasp more reliable than get_grasp_pose for simple table objects
+- 3-waypoint approach (pre_grasp/approach/grasp) + lift works well
+- Always re-perceive after a failed grasp attempt
 
-Initial script version based on Experiment 1:
+Experiment 2 (2026-03-23_17-46-38): Pick up green cup with yellow block obstacle
+- get_position_from_labels may fail for some objects; naive_pointing is a good fallback
+- Obstacle removal: first grasp at detected z failed (too high), lowering by 1.5cm worked
+- Top-down grasp on cups can hit 'dt' motion planning errors near table surface
+- get_grasp_pose + plan_grasp succeeded for cup handle grasp as fallback
+- Lesson: use naive_pointing fallback in locate_object; for cups/mugs, try
+  get_grasp_pose as a fallback strategy when top-down fails with 'dt' errors
 """
 
 import numpy as np
@@ -33,9 +29,11 @@ NEUTRAL_ORIENTATION = [np.pi, 0.0, 0.0]
 TOP_DOWN_RPY = [np.pi, 0.0, 0.0]
 
 PRE_GRASP_HEIGHT = 0.15   # Height above object for pre-grasp
-APPROACH_HEIGHT = 0.05     # Height above object for approach
-GRASP_HEIGHT = 0.02        # Height above object center for actual grasp
+APPROACH_HEIGHT = 0.02     # Height above object for approach (reduced from 0.05)
+GRASP_HEIGHT_OFFSET = 0.0  # Offset from detected position for grasp
 LIFT_HEIGHT = 0.20         # Height to lift after grasping
+
+PLACE_OFFSET_Y = -0.20    # Y-offset for placing obstacles to the side
 
 
 # ============================================================
@@ -43,14 +41,20 @@ LIFT_HEIGHT = 0.20         # Height to lift after grasping
 # ============================================================
 
 def locate_object(robot, label):
-    """Locate an object using get_position_from_labels with fallback to naive_pointing."""
+    """
+    Locate an object using get_position_from_labels, with fallback chain:
+    1. get_position_from_labels
+    2. rescan_wrist + get_position_from_labels
+    3. naive_pointing (most robust fallback, learned from Exp 2)
+    """
+    # Primary method
     results = robot.get_position_from_labels([label])
     if results:
         pos = np.array(results[0]['3d_position'])
         print(f"Located '{label}' at {pos}")
         return pos
 
-    # Fallback: rescan and retry
+    # Fallback 1: rescan and retry
     print(f"Failed to locate '{label}', rescanning...")
     robot.rescan_wrist()
     results = robot.get_position_from_labels([label])
@@ -59,25 +63,37 @@ def locate_object(robot, label):
         print(f"Located '{label}' at {pos} (after rescan)")
         return pos
 
-    print(f"Could not locate '{label}' with get_position_from_labels")
+    # Fallback 2: naive_pointing (learned from Exp 2 - worked when primary failed)
+    print(f"Trying naive_pointing for '{label}'...")
+    result = robot.naive_pointing(label)
+    if result is not None:
+        pos = np.array(result['3d_position'])
+        print(f"Located '{label}' at {pos} (via naive_pointing)")
+        return pos
+
+    print(f"Could not locate '{label}' with any method")
     return None
 
 
-def top_down_grasp(robot, target_pos):
+def top_down_grasp(robot, target_pos, z_offset=0.0):
     """
     Execute a top-down grasp sequence at the given position.
     Uses a 3-waypoint approach: pre-grasp -> approach -> grasp -> lift.
 
+    Args:
+        target_pos: 3D position of the object
+        z_offset: Additional z offset for grasp point (negative = lower)
+
     Returns True if gripper is partially closed (indicating successful grasp).
     """
+    grasp = target_pos.copy()
+    grasp[2] += GRASP_HEIGHT_OFFSET + z_offset
+
     pre_grasp = target_pos.copy()
     pre_grasp[2] += PRE_GRASP_HEIGHT
 
     approach = target_pos.copy()
     approach[2] += APPROACH_HEIGHT
-
-    grasp = target_pos.copy()
-    grasp[2] += GRASP_HEIGHT
 
     lift = target_pos.copy()
     lift[2] += LIFT_HEIGHT
@@ -90,6 +106,38 @@ def top_down_grasp(robot, target_pos):
     robot.move_gripper_to(lift.tolist(), TOP_DOWN_RPY)
 
     return check_grasp_success(robot)
+
+
+def grasp_via_plan(robot, label, description="grasp the object", hint_pos=None):
+    """
+    Use get_grasp_pose + plan_grasp for more complex grasps (e.g., handles).
+    Learned from Exp 2: this works well for cup handles when top-down fails.
+
+    Returns True if gripper indicates successful grasp.
+    """
+    print(f"Attempting planned grasp for '{label}'...")
+    robot.open_gripper()
+
+    kwargs = {}
+    if hint_pos is not None:
+        kwargs['point_to_grasp'] = hint_pos.tolist() if isinstance(hint_pos, np.ndarray) else hint_pos
+
+    grasp_candidates = robot.get_grasp_pose(label, description, **kwargs)
+    if not grasp_candidates:
+        print(f"get_grasp_pose found no candidates for '{label}'")
+        return False
+
+    robot.plan_grasp(grasp_candidates)
+
+    if check_grasp_success(robot):
+        # Lift after successful grasp
+        state = robot.get_state()['robot_state']
+        lift_pos = np.array(state['position'])
+        lift_pos[2] += LIFT_HEIGHT
+        robot.move_gripper_to(lift_pos.tolist(), state['orientation'])
+        return True
+
+    return False
 
 
 def check_grasp_success(robot):
@@ -109,21 +157,103 @@ def move_to_neutral(robot):
     robot.move_gripper_to(NEUTRAL_POSITION, NEUTRAL_ORIENTATION)
 
 
-def pick_up(robot, target_label):
+def remove_obstacle(robot, obstacle_label, target_pos):
     """
-    Main pick-up routine. Locates the target object and picks it up
-    using a top-down grasp strategy.
+    Remove an obstacle object by picking it up and placing it to the side.
+    Learned from Exp 2: may need z-offset adjustment if first grasp misses.
+
+    Args:
+        robot: Robot interface
+        obstacle_label: Label of the obstacle to remove
+        target_pos: Position of the target object (used to compute placement)
+
+    Returns True if obstacle was successfully removed.
+    """
+    print(f"--- Removing obstacle: '{obstacle_label}' ---")
+
+    obs_pos = locate_object(robot, obstacle_label)
+    if obs_pos is None:
+        print(f"Could not find obstacle '{obstacle_label}', assuming already clear.")
+        return True
+
+    # Attempt 1: grasp at detected position
+    if top_down_grasp(robot, obs_pos):
+        place_obstacle(robot, target_pos)
+        return True
+
+    # Attempt 2: lower the grasp by 1.5cm (learned from Exp 2)
+    print("Obstacle grasp failed, retrying with lower z-offset...")
+    move_to_neutral(robot)
+    robot.open_gripper()
+
+    obs_pos = locate_object(robot, obstacle_label)
+    if obs_pos is None:
+        print(f"Could not re-locate obstacle '{obstacle_label}'")
+        return False
+
+    if top_down_grasp(robot, obs_pos, z_offset=-0.015):
+        place_obstacle(robot, target_pos)
+        return True
+
+    print(f"FAILED to remove obstacle '{obstacle_label}'")
+    return False
+
+
+def place_obstacle(robot, target_pos):
+    """Place the currently held obstacle to the side of the target object."""
+    place_pos = target_pos.copy()
+    place_pos[1] += PLACE_OFFSET_Y  # Move to the side
+    place_pos[2] += 0.02  # Slightly above table
+
+    pre_place = place_pos.copy()
+    pre_place[2] += PRE_GRASP_HEIGHT
+
+    current_ori = robot.get_state()['robot_state']['orientation']
+
+    robot.move_gripper_to(pre_place.tolist(), TOP_DOWN_RPY)
+    robot.move_gripper_to(place_pos.tolist(), TOP_DOWN_RPY)
+    robot.open_gripper()
+    robot.move_gripper_to(pre_place.tolist(), TOP_DOWN_RPY)
+    print("Obstacle placed to the side.")
+
+
+def pick_up(robot, target_label, obstacle_label=None):
+    """
+    Main pick-up routine. Optionally removes an obstacle first, then
+    locates and picks up the target object.
+
+    Strategy (learned from experiments):
+    1. If obstacle exists, remove it first
+    2. Locate target and attempt top-down grasp
+    3. On failure: retry with recovery (neutral pose + re-perceive)
+    4. Final fallback: try get_grasp_pose + plan_grasp (works for handles)
 
     Args:
         robot: The robot interface object
-        target_label: String label for the object to pick up (e.g., "green mug")
+        target_label: String label for the object to pick up
+        obstacle_label: Optional label for an obstacle to remove first
 
     Returns:
         True if object was successfully picked up, False otherwise
     """
     print(f"=== Pick Up Task: '{target_label}' ===")
+    if obstacle_label:
+        print(f"    Obstacle to remove: '{obstacle_label}'")
 
-    # Step 1: Locate the object
+    # Step 0: Remove obstacle if specified
+    if obstacle_label:
+        target_pos = locate_object(robot, target_label)
+        if target_pos is None:
+            print("FAILED: Could not locate target for obstacle placement reference.")
+            return False
+
+        if not remove_obstacle(robot, obstacle_label, target_pos):
+            print("FAILED: Could not remove obstacle.")
+            return False
+
+        move_to_neutral(robot)
+
+    # Step 1: Locate the target object (re-perceive after obstacle removal)
     target_pos = locate_object(robot, target_label)
     if target_pos is None:
         print("FAILED: Could not locate target object.")
@@ -135,7 +265,7 @@ def pick_up(robot, target_label):
         return True
 
     # Step 3: Recovery - return to neutral, re-perceive, retry
-    print("First attempt failed. Recovering...")
+    print("First grasp attempt failed. Recovering...")
     move_to_neutral(robot)
     robot.open_gripper()
 
@@ -148,7 +278,16 @@ def pick_up(robot, target_label):
         print(f"SUCCESS: Picked up '{target_label}' on retry")
         return True
 
-    print(f"FAILED: Could not pick up '{target_label}' after retry.")
+    # Step 4: Fallback - use get_grasp_pose + plan_grasp (for handles etc.)
+    print("Top-down grasp failed. Trying planned grasp as fallback...")
+    move_to_neutral(robot)
+    if grasp_via_plan(robot, target_label,
+                      f"grasp the {target_label} to pick it up",
+                      hint_pos=target_pos):
+        print(f"SUCCESS: Picked up '{target_label}' via planned grasp")
+        return True
+
+    print(f"FAILED: Could not pick up '{target_label}' after all attempts.")
     return False
 
 
@@ -156,7 +295,7 @@ def pick_up(robot, target_label):
 # Entry Point
 # ============================================================
 if __name__ == "__main__":
-    # Usage: set target_label and optional obstacle_label before running
-    # target_label = "green mug"
-    # pick_up(robot, target_label)
+    # Example usage:
+    # pick_up(robot, "green cup", obstacle_label="yellow block")
+    # pick_up(robot, "green mug")
     pass
