@@ -23,6 +23,15 @@ Experiment 3 (2026-03-23_18-38-26): Pick up green mug on the shelf
 - After grasping inside shelf: MUST retreat horizontally (x -= 0.15) BEFORE lifting
   vertically to avoid collision with shelf above
 - Lesson: detect if object is in an enclosed space; use side grasp + horizontal retreat
+
+Experiment 4 (2026-03-23_18-45-00): Pick up blue cube with orange cube obstacle
+- Obstacle removal worked: top-down grasp on orange cube (gripper=0.436), placed aside
+- Blue cube detected at z=0.035 - way too low for gripper to reach
+- ALL grasp attempts (top-down, get_grasp_pose, neutral reset) failed with 'dt' error
+- Root cause: z < ~0.05 means object is at/below table surface level, unreachable
+- Lesson: clamp minimum grasp z to avoid motion planning failures. If z < MIN_GRASP_Z,
+  raise it to MIN_GRASP_Z. Also re-perceive the target AFTER obstacle removal since
+  the obstacle may have been occluding proper depth sensing.
 """
 
 import numpy as np
@@ -41,6 +50,7 @@ GRASP_HEIGHT_OFFSET = 0.0  # Offset from detected position for grasp
 LIFT_HEIGHT = 0.20         # Height to lift after grasping
 
 PLACE_OFFSET_Y = -0.20    # Y-offset for placing obstacles to the side
+MIN_GRASP_Z = 0.06        # Minimum z for grasp (below this causes 'dt' errors)
 
 
 # ============================================================
@@ -95,6 +105,11 @@ def top_down_grasp(robot, target_pos, z_offset=0.0):
     """
     grasp = target_pos.copy()
     grasp[2] += GRASP_HEIGHT_OFFSET + z_offset
+
+    # Clamp grasp z to minimum safe height (learned from Exp 4: z=0.035 caused 'dt' errors)
+    if grasp[2] < MIN_GRASP_Z:
+        print(f"Warning: grasp z={grasp[2]:.3f} too low, clamping to {MIN_GRASP_Z}")
+        grasp[2] = MIN_GRASP_Z
 
     pre_grasp = target_pos.copy()
     pre_grasp[2] += PRE_GRASP_HEIGHT
@@ -279,6 +294,8 @@ def pick_up(robot, target_label, obstacle_label=None, enclosed=False):
             return False
 
         move_to_neutral(robot)
+        # Rescan after obstacle removal (Exp 4: obstacle may have blocked depth sensing)
+        robot.rescan_wrist()
 
     # Step 1: Locate the target object (re-perceive after obstacle removal)
     target_pos = locate_object(robot, target_label)
