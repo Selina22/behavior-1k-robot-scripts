@@ -32,6 +32,15 @@ Experiment 4 (2026-03-23_18-45-00): Pick up blue cube with orange cube obstacle
 - Lesson: clamp minimum grasp z to avoid motion planning failures. If z < MIN_GRASP_Z,
   raise it to MIN_GRASP_Z. Also re-perceive the target AFTER obstacle removal since
   the obstacle may have been occluding proper depth sensing.
+
+Experiment 5 (2026-03-23_16-59-15): Pick up green cup with yellow block obstacle
+- Same pattern: get_position_from_labels failed for yellow block, naive_pointing worked
+- Obstacle grasp at approach height (z+0.02) succeeded (gripper=0.586)
+- Cup detected at z=0.026 - too low, top-down and plan_grasp both hit 'dt' errors
+- After robot.reset() + re-perceive + 4cm z-offset, top-down finally succeeded (gripper=0.41)
+- Lesson: robot.reset() is a last-resort recovery for stuck states. Adding z_offset=+0.04
+  to low-z objects is a proven fix. The approach height itself should ensure we don't
+  go below the safe z threshold.
 """
 
 import numpy as np
@@ -116,6 +125,8 @@ def top_down_grasp(robot, target_pos, z_offset=0.0):
 
     approach = target_pos.copy()
     approach[2] += APPROACH_HEIGHT
+    if approach[2] < MIN_GRASP_Z:
+        approach[2] = MIN_GRASP_Z + 0.01
 
     lift = target_pos.copy()
     lift[2] += LIFT_HEIGHT
@@ -193,6 +204,16 @@ def check_grasp_success(robot):
 def move_to_neutral(robot):
     """Move robot to a safe neutral position."""
     robot.move_gripper_to(NEUTRAL_POSITION, NEUTRAL_ORIENTATION)
+
+
+def safe_reset(robot):
+    """
+    Last-resort recovery: full robot reset to home position.
+    Learned from Exp 5: when robot gets stuck in unrecoverable poses,
+    robot.reset() returns it to a known safe configuration.
+    """
+    print("Performing full robot reset (last resort recovery)...")
+    robot.reset()
 
 
 def remove_obstacle(robot, obstacle_label, target_pos):
@@ -353,6 +374,22 @@ def pick_up(robot, target_label, obstacle_label=None, enclosed=False):
                       f"grasp the {target_label} to pick it up",
                       hint_pos=target_pos):
         print(f"SUCCESS: Picked up '{target_label}' via planned grasp")
+        return True
+
+    # Step 5: Last resort - full reset + re-perceive + top-down with z-offset
+    # Learned from Exp 5: robot.reset() + 4cm z-offset saved the task
+    print("All methods failed. Attempting full reset recovery...")
+    safe_reset(robot)
+    robot.rescan_wrist()
+
+    target_pos = locate_object(robot, target_label)
+    if target_pos is None:
+        print(f"FAILED: Could not locate '{target_label}' after reset.")
+        return False
+
+    # Try with explicit z-offset of +4cm (proven fix from Exp 5)
+    if top_down_grasp(robot, target_pos, z_offset=0.04):
+        print(f"SUCCESS: Picked up '{target_label}' after reset with z-offset")
         return True
 
     print(f"FAILED: Could not pick up '{target_label}' after all attempts.")
